@@ -1,10 +1,10 @@
 #!/usr/bin/python3
 
-import threading
-import time
 import heapq
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
+from typing import List
+
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
@@ -12,42 +12,46 @@ from ryu.ofproto import ofproto_v1_3, inet
 from ryu.lib.packet import packet, arp, ethernet, ipv4, ether_types
 from ryu.ofproto.ofproto_v1_3 import OFPPS_LINK_DOWN, OFPPS_LIVE
 from ryu.topology import event
-from typing import List
+from ryu.lib import hub
 
 MAX_PATHS = 2
 
 @dataclass
 class Paths:
-    """ Paths container """
     path: List[int]
     cost: float
 
+
 class Controller13(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+    COOKIE = 0x13  # cookie riêng cho app này
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.datapath_list = {}
-        self.switches = []
-        self.neigh = defaultdict(dict)
-        self.hosts = {}
-        self.path_table = {}
-        self.paths_table = {}
-        self.path_calculation_keeper = []
-        self.prev_bytes = defaultdict(dict)
-        self.bw = defaultdict(dict)
-        self.arp_table = {}
-        self.path_with_ports_table = {}
-        self.running = False
-        self.thread1 = None
-        self.thread2 = None
-        self.lock = threading.Lock()
-        self.src = None
-        self.dst = None
-        self.first_port = None
-        self.last_port = None
-        self.active_paths = {}
-        self.traffic = {}
+
+        # Topology & datapaths
+        self.datapath_list = {}                 
+        self.switches = []                      
+        self.neigh = defaultdict(dict)          
+
+        # Hosts & ARP
+        self.hosts = {}                         
+        self.arp_table = {}                     
+
+        # Paths
+        self.path_table = {}                    
+        self.path_with_ports_table = {}         
+        self.active_paths = {}                  
+
+        # Traffic & stats
+        self.traffic = defaultdict(set)         
+        self.prev_bytes = defaultdict(dict)     
+        self.bw = defaultdict(dict)             
+
+        # Periodic port stats
+        self.port_stats_thread = hub.spawn(self._port_stats_loop)
+
+    # ========= Switch features / pipeline =========
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def _switch_features_handler(self, ev):
@@ -55,32 +59,38 @@ class Controller13(app_manager.RyuApp):
         ofp = dp.ofproto
         parser = dp.ofproto_parser
 
-        match_icmp = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ip_proto=inet.IPPROTO_ICMP)
+        # ICMP -> controller (debug / học topo)
+        match_icmp = parser.OFPMatch(
+            eth_type=ether_types.ETH_TYPE_IP,
+            ip_proto=inet.IPPROTO_ICMP
+        )
         actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
         mod = parser.OFPFlowMod(
             datapath=dp,
             table_id=0,
-            priority=1,
+            priority=10,
             match=match_icmp,
-            instructions=inst
+            instructions=inst,
+            cookie=self.COOKIE
         )
         dp.send_msg(mod)
-        self.logger.info(f"Installed ICMP flow on switch {dp.id}: send to controller")
 
+        # ARP -> controller
         match_arp = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_ARP)
         actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
         mod = parser.OFPFlowMod(
             datapath=dp,
             table_id=0,
-            priority=1,
+            priority=10,
             match=match_arp,
-            instructions=inst
+            instructions=inst,
+            cookie=self.COOKIE
         )
         dp.send_msg(mod)
-        self.logger.info(f"Installed ARP flow on switch {dp.id}: send to controller")
 
+        # Table-miss -> goto table 1
         match = parser.OFPMatch()
         inst = [parser.OFPInstructionGotoTable(1)]
         mod = parser.OFPFlowMod(
@@ -88,11 +98,12 @@ class Controller13(app_manager.RyuApp):
             table_id=0,
             priority=0,
             match=match,
-            instructions=inst
+            instructions=inst,
+            cookie=self.COOKIE
         )
         dp.send_msg(mod)
-        self.logger.info(f"Table-miss for table 0 on switch {dp.id}: goto table 1")
 
+        # Table 1 default: flood (chỉ khi chưa có rule tốt hơn)
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofp.OFPP_FLOOD)]
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
@@ -101,196 +112,218 @@ class Controller13(app_manager.RyuApp):
             table_id=1,
             priority=0,
             match=match,
-            instructions=inst
+            instructions=inst,
+            cookie=self.COOKIE
         )
         dp.send_msg(mod)
 
-    def install_paths(self, src, first_port, dst, last_port, ip_src, ip_dst):
-        self.configure(src, first_port, dst, last_port)
-        self.active_paths.setdefault((ip_src, ip_dst), {})
-        time.sleep(0.2)
+        self.logger.info("Configured base pipeline on switch %s", dp.id)
 
-        temp = self.path_with_ports_table[(src, first_port, dst, last_port)][0]
-        for node in self.path_table[(src, first_port, dst, last_port)][0].path:
-            dp = self.datapath_list[node]
-            parser = dp.ofproto_parser
-            in_port, out_port = temp[node]
-            actions = [parser.OFPActionOutput(out_port)]
+    # ========= Port stats (bandwidth) =========
 
-            match = parser.OFPMatch(
-                in_port=in_port,
-                eth_type=ether_types.ETH_TYPE_IP,
-                ipv4_src=ip_src,
-                ipv4_dst=ip_dst,
-                ip_proto=inet.IPPROTO_ICMP
-            )
-            self.add_flow(dp, 22222, match, actions, idle_timeout=30)
-            self.logger.info(f"ICMP flow installed on switch {node}, in_port={in_port}, out_port={out_port}")
-
-            match = parser.OFPMatch(
-                in_port=in_port,
-                eth_type=ether_types.ETH_TYPE_ARP,
-                arp_spa=ip_src,
-                arp_tpa=ip_dst
-            )
-            self.add_flow(dp, 11111, match, actions, idle_timeout=30)
-            self.logger.info(f"ARP flow installed on switch {node}, in_port={in_port}, out_port={out_port}")
-
-        self.active_paths[(ip_src, ip_dst)] = temp
-        return temp[src][1]
-
-    def configure(self, src, first_port, dst, last_port):
-        with self.lock:
-            self.src = src
-            self.first_port = first_port
-            self.dst = dst
-            self.last_port = last_port
-
-    def start_discovery(self):
-        if not self.running:
-            self.running = True
-            self.thread1 = threading.Thread(target=self._loop, args=(0,))
-            self.thread2 = threading.Thread(target=self._loop, args=(1,))
-            self.thread1.start()
-            self.thread2.start()
-
-    def _loop(self, type_action):
-        while self.running:
+    def _port_stats_loop(self):
+        while True:
             try:
-                with self.lock:
-                    src = self.src
-                    first_port = self.first_port
-                    dst = self.dst
-                    last_port = self.last_port
-
-                if src and dst:
-                    if type_action == 0:
-                        self.topology_discover(src, first_port, dst, last_port)
-                    elif type_action == 1:
-                        self.topology_discover(dst, last_port, src, first_port)
-                    else: pass
+                for dp in list(self.datapath_list.values()):
+                    ofp = dp.ofproto
+                    parser = dp.ofproto_parser
+                    req = parser.OFPPortStatsRequest(dp, 0, ofp.OFPP_ANY)
+                    dp.send_msg(req)
             except Exception as e:
-                self.logger.error(f"Error in discover: {e}")
-            time.sleep(0.1)
-
-    def topology_discover(self, src, first_port, dst, last_port):
-        paths = self.find_paths_and_costs(src, dst)
-        path = self.find_n_optimal_paths(paths)
-        path_with_port = self.add_ports_to_paths(path, first_port, last_port)
-        self.logger.info(f"Optimal Path with port: {path_with_port}")
-
-        self.paths_table[(src, first_port, dst, last_port)] = paths
-        self.path_table[(src, first_port, dst, last_port)] = path
-        self.path_with_ports_table[(src, first_port, dst, last_port)] = path_with_port
-
-    def find_paths_and_costs(self, src, dst):
-        """
-        Implementation of Breath-First Search Algorithm (BFS)
-        Output of this function returns a list on class Paths objects
-        """
-        if src == dst:
-            return [Paths([src], 0)]
-        queue = [(src, [src])]
-        possible_paths = list()
-        while queue:
-            (edge, path) = queue.pop()
-            for vertex in set(self.neigh[edge]) - set(path):
-                if vertex == dst:
-                    path_to_dst = path + [vertex]
-                    cost_of_path = self.find_path_cost(path_to_dst)
-                    possible_paths.append(Paths(path_to_dst, cost_of_path))
-                else:
-                    queue.append((vertex, path + [vertex]))
-        return possible_paths
-
-    def find_n_optimal_paths(self, paths, number_of_optimal_paths=MAX_PATHS):
-        """arg paths is a list containing lists of possible paths"""
-        costs = [path.cost for path in paths]
-        optimal_paths_indexes = list(map(costs.index, heapq.nsmallest(number_of_optimal_paths, costs)))
-        optimal_paths = [paths[op_index] for op_index in optimal_paths_indexes]
-        return optimal_paths
-
-    def add_ports_to_paths(self, paths, first_port, last_port):
-        """
-        Add the ports to all switches including hosts
-        """
-        paths_n_ports = list()
-        bar = dict()
-        in_port = first_port
-        for s1, s2 in zip(paths[0].path[:-1], paths[0].path[1:]):
-            out_port = self.neigh[s1][s2]
-            bar[s1] = (in_port, out_port)
-            in_port = self.neigh[s2][s1]
-        bar[paths[0].path[-1]] = (in_port, last_port)
-        paths_n_ports.append(bar)
-        return paths_n_ports
-
-    def add_flow(self, datapath, priority, match, actions, idle_timeout, buffer_id=None):
-        """ Method Provided by the source Ryu library."""
-
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
-                                             actions)]
-        if buffer_id:
-            mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
-                                    priority=priority, match=match, idle_timeout=idle_timeout,
-                                    instructions=inst)
-        else:
-            mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
-                                    match=match, idle_timeout=idle_timeout, instructions=inst)
-        datapath.send_msg(mod)
-
-    def find_path_cost(self, path):
-        """ arg path is a list with all nodes in our route """
-        path_cost = []
-        i = 0
-        while i < len(path) - 1:
-            port1 = self.neigh[path[i]][path[i + 1]]
-            bandwidth_between_two_nodes = self.get_bandwidth(path, port1, i)
-            path_cost.append(bandwidth_between_two_nodes)
-            i += 1
-        return sum(path_cost)
-
-    def get_bandwidth(self, path, port, index):
-        return self.bw[path[index]][port]
+                self.logger.error("Port stats loop error: %s", e)
+            hub.sleep(1)
 
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def port_stats_reply_handler(self, ev):
-        stats = ev.msg.body
         dp = ev.msg.datapath
         dpid = dp.id
         self.bw.setdefault(dpid, {})
         self.prev_bytes.setdefault(dpid, {})
-        for p in stats:
+
+        for p in ev.msg.body:
             port_no = p.port_no
             if port_no == dp.ofproto.OFPP_LOCAL:
                 continue
+
             prev = self.prev_bytes[dpid].get(port_no, p.tx_bytes)
-            bw_val = (p.tx_bytes - prev) * 8.0 / 1e6
+            delta = p.tx_bytes - prev
+            bw_val = max(delta, 0) * 8.0 / 1e6  # Mbps (tx only)
             self.bw[dpid][port_no] = bw_val
             self.prev_bytes[dpid][port_no] = p.tx_bytes
-        self.logger.debug(f"BW stats for switch {dpid}: {self.bw[dpid]}")
 
-    def run_check(self, ofp_parser, dp):
-        threading.Timer(1.0, self.run_check, args=(ofp_parser, dp)).start()
-        req = ofp_parser.OFPPortStatsRequest(dp)
-        dp.send_msg(req)
+        self.logger.debug("BW stats for switch %s: %s", dpid, self.bw[dpid])
+
+    # ========= Flow utils =========
+
+    def add_flow(self, datapath, priority, match, actions,
+                 idle_timeout=0, buffer_id=None):
+        ofp = datapath.ofproto
+        parser = datapath.ofproto_parser
+        inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+
+        kwargs = dict(
+            datapath=datapath,
+            priority=priority,
+            match=match,
+            idle_timeout=idle_timeout,
+            instructions=inst,
+            cookie=self.COOKIE
+        )
+        if buffer_id is not None:
+            kwargs["buffer_id"] = buffer_id
+
+        mod = parser.OFPFlowMod(**kwargs)
+        datapath.send_msg(mod)
+
+    def remove_flows(self, path_ports):
+        # Xóa các flow theo in_port + cookie của app
+        for dpid, (in_port, _out_port) in path_ports.items():
+            dp = self.datapath_list.get(dpid)
+            if not dp:
+                continue
+            ofp = dp.ofproto
+            parser = dp.ofproto_parser
+
+            match = parser.OFPMatch(in_port=in_port)
+            mod = parser.OFPFlowMod(
+                datapath=dp,
+                command=ofp.OFPFC_DELETE,
+                out_port=ofp.OFPP_ANY,
+                out_group=ofp.OFPG_ANY,
+                match=match,
+                cookie=self.COOKIE,
+                cookie_mask=0xffffffffffffffff
+            )
+            dp.send_msg(mod)
+
+    # ========= Path computation (BFS) =========
+
+    def find_paths_and_costs(self, src, dst):
+        if src == dst:
+            return [Paths([src], 0)]
+
+        queue = deque([(src, [src])])
+        possible_paths = []
+
+        while queue:
+            node, path = queue.popleft()
+            for nxt in set(self.neigh[node].keys()) - set(path):
+                new_path = path + [nxt]
+                if nxt == dst:
+                    cost = self.find_path_cost(new_path)
+                    possible_paths.append(Paths(new_path, cost))
+                else:
+                    queue.append((nxt, new_path))
+
+        return possible_paths
+
+    def find_path_cost(self, path):
+        # Hiện tại: cost = số hop (dễ hiểu, ổn định)
+        # Có thể nâng cấp: kết hợp hop + băng thông + delay
+        return len(path) - 1
+
+    def find_n_optimal_paths(self, paths, number_of_optimal_paths=MAX_PATHS):
+        if not paths:
+            return []
+        number_of_optimal_paths = min(number_of_optimal_paths, len(paths))
+        costs = [p.cost for p in paths]
+        idxs = list(map(costs.index, heapq.nsmallest(number_of_optimal_paths, costs)))
+        return [paths[i] for i in idxs]
+
+    def add_ports_to_path(self, path_obj, first_port, last_port):
+        # Gắn in/out port cho từng switch trên path
+        path = path_obj.path
+        ports = {}
+        in_port = first_port
+
+        for s1, s2 in zip(path[:-1], path[1:]):
+            out_port = self.neigh[s1][s2]
+            ports[s1] = (in_port, out_port)
+            in_port = self.neigh[s2][s1]
+
+        ports[path[-1]] = (in_port, last_port)
+        return ports
+
+    # ========= Compute + install path =========
+
+    def compute_and_install_path(self, src_sw, src_port, dst_sw, dst_port,
+                                 ip_src, ip_dst):
+        paths = self.find_paths_and_costs(src_sw, dst_sw)
+        if not paths:
+            self.logger.warning("No path between switches %s and %s", src_sw, dst_sw)
+            return None
+
+        best = self.find_n_optimal_paths(paths, 1)[0]
+        path_ports = self.add_ports_to_path(best, src_port, dst_port)
+
+        for dpid, (in_port, out_port) in path_ports.items():
+            dp = self.datapath_list.get(dpid)
+            if not dp:
+                continue
+            parser = dp.ofproto_parser
+
+            # IP traffic ip_src -> ip_dst
+            match_ip = parser.OFPMatch(
+                eth_type=ether_types.ETH_TYPE_IP,
+                ipv4_src=ip_src,
+                ipv4_dst=ip_dst
+            )
+            actions = [parser.OFPActionOutput(out_port)]
+            self.add_flow(dp, priority=100, match=match_ip,
+                          actions=actions, idle_timeout=60)
+
+            # ARP giữa 2 host này
+            match_arp = parser.OFPMatch(
+                eth_type=ether_types.ETH_TYPE_ARP,
+                arp_spa=ip_src,
+                arp_tpa=ip_dst
+            )
+            self.add_flow(dp, priority=90, match=match_arp,
+                          actions=actions, idle_timeout=60)
+
+            self.logger.info(
+                "Installed path on switch %s: %s -> %s via in_port=%s out_port=%s",
+                dpid, ip_src, ip_dst, in_port, out_port
+            )
+
+        # Lưu lại
+        self.path_table[(ip_src, ip_dst)] = best.path
+        self.path_with_ports_table[(ip_src, ip_dst)] = path_ports
+        self.active_paths[(ip_src, ip_dst)] = path_ports
+
+        first_hop = best.path[0]
+        return path_ports.get(first_hop, (None, None))[1]
+
+    def _try_install_for_hosts(self, src_ip, dst_ip, src_mac, dst_mac):
+        if src_mac not in self.hosts or dst_mac not in self.hosts:
+            return None
+
+        src_sw, src_port = self.hosts[src_mac]
+        dst_sw, dst_port = self.hosts[dst_mac]
+
+        out_port = self.compute_and_install_path(
+            src_sw, src_port, dst_sw, dst_port, src_ip, dst_ip
+        )
+        # cài luôn path ngược
+        self.compute_and_install_path(
+            dst_sw, dst_port, src_sw, src_port, dst_ip, src_ip
+        )
+
+        return out_port
+
+    # ========= PacketIn =========
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
         msg = ev.msg
-        datapath = msg.datapath
-        dpid = datapath.id
-        ofp = datapath.ofproto
-        parser = datapath.ofproto_parser
+        dp = msg.datapath
+        dpid = dp.id
+        ofp = dp.ofproto
+        parser = dp.ofproto_parser
         in_port = msg.match['in_port']
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocols(ethernet.ethernet)[0]
-        arp_pkt = pkt.get_protocol(arp.arp)
-        ip_pkt = pkt.get_protocol(ipv4.ipv4)
 
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             return
@@ -298,240 +331,272 @@ class Controller13(app_manager.RyuApp):
         src_mac = eth.src
         dst_mac = eth.dst
 
+        # Học host
         if src_mac not in self.hosts:
             self.hosts[src_mac] = (dpid, in_port)
+            self.logger.info("Learned host %s at %s:%s", src_mac, dpid, in_port)
 
         out_port = ofp.OFPP_FLOOD
 
-        self.start_discovery()
+        arp_pkt = pkt.get_protocol(arp.arp)
+        ip_pkt = pkt.get_protocol(ipv4.ipv4)
 
-        if eth.ethertype == ether_types.ETH_TYPE_ARP and arp_pkt:
+        # ARP
+        if arp_pkt:
             src_ip = arp_pkt.src_ip
             dst_ip = arp_pkt.dst_ip
-            self.traffic.setdefault(src_ip, set())
+
+            self.arp_table[src_ip] = src_mac
             self.traffic[src_ip].add(dst_ip)
 
             self.logger.info(
-                f"Received ARP packet: opcode={arp_pkt.opcode}, src_ip={src_ip}, dst_ip={dst_ip}, src_mac={src_mac}, dst_mac={dst_mac} on switch {dpid}")
+                "ARP opcode=%s %s(%s) -> %s(%s) on %s",
+                arp_pkt.opcode, src_ip, src_mac, dst_ip, dst_mac, dpid
+            )
 
             if arp_pkt.opcode == arp.ARP_REPLY:
-                self.arp_table[src_ip] = src_mac
-                h1 = self.hosts[src_mac]
-                h2 = self.hosts[dst_mac]
-
-                self.logger.info(f" ARP Reply from: {src_ip} to: {dst_ip} H1: {h1} H2: {h2}")
-
-                out_port = self.install_paths(h1[0], h1[1], h2[0], h2[1], src_ip, dst_ip)
-                self.install_paths(h2[0], h2[1], h1[0], h1[1], dst_ip, src_ip)
+                if dst_mac in self.hosts:
+                    port = self._try_install_for_hosts(src_ip, dst_ip, src_mac, dst_mac)
+                    if port is not None:
+                        out_port = port
 
             elif arp_pkt.opcode == arp.ARP_REQUEST:
-                if dst_ip in self.arp_table:
-                    self.arp_table[src_ip] = src_mac
-                    dst_mac = self.arp_table[dst_ip]
-                    h1 = self.hosts[src_mac]
-                    if dst_mac in self.hosts:
-                        h2 = self.hosts[dst_mac]
-                        self.logger.info(f" ARP Reply from: {src_ip} to: {dst_ip} H1: {h1} H2: {h2}")
-                        out_port = self.install_paths(h1[0], h1[1], h2[0], h2[1], src_ip, dst_ip)
-                        self.install_paths(h2[0], h2[1], h1[0], h1[1], dst_ip, src_ip)
+                dst_mac_known = self.arp_table.get(dst_ip)
+                if dst_mac_known and dst_mac_known in self.hosts:
+                    port = self._try_install_for_hosts(src_ip, dst_ip, src_mac, dst_mac_known)
+                    if port is not None:
+                        out_port = port
 
-        if eth.ethertype == ether_types.ETH_TYPE_IP and ip_pkt and ip_pkt.proto == inet.IPPROTO_ICMP:
+        # IP (ICMP/TCP/UDP, match full ip_src/ip_dst)
+        elif ip_pkt:
             src_ip = ip_pkt.src
             dst_ip = ip_pkt.dst
             self.arp_table[src_ip] = src_mac
 
-            self.logger.info(f" IP Proto ICMP from: {src_ip} to: {dst_ip}")
+            self.logger.info(
+                "IP proto=%s %s(%s) -> %s(%s)",
+                ip_pkt.proto, src_ip, src_mac, dst_ip, dst_mac, dpid
+            )
 
+            if dst_mac in self.hosts:
+                port = self._try_install_for_hosts(src_ip, dst_ip, src_mac, dst_mac)
+                if port is not None:
+                    out_port = port
+
+        # Gửi tiếp
         actions = [parser.OFPActionOutput(out_port)]
         out = parser.OFPPacketOut(
-            datapath=datapath,
+            datapath=dp,
             buffer_id=msg.buffer_id,
             in_port=in_port,
             actions=actions,
-            data=msg.data
+            data=None if msg.buffer_id != ofp.OFP_NO_BUFFER else msg.data
         )
-        datapath.send_msg(out)
+        dp.send_msg(out)
 
-    def remove_flows(self, path):
-        for dpid, (in_port, out_port) in path.items():
-            datapath = self.datapath_list[dpid]
-            if not datapath:
-                continue
-            ofproto = datapath.ofproto
-            parser = datapath.ofproto_parser
-
-            match = parser.OFPMatch(in_port=in_port)
-            mod = parser.OFPFlowMod(
-                datapath=datapath,
-                command=ofproto.OFPFC_DELETE,
-                out_port=out_port,
-                out_group=ofproto.OFPG_ANY,
-                match=match
-            )
-            datapath.send_msg(mod)
+    # ========= Topology events =========
 
     @set_ev_cls(event.EventSwitchEnter)
     def switch_enter_handler(self, ev):
-        switch_dp = ev.switch.dp
-        switch_dpid = switch_dp.id
-        ofp_parser = switch_dp.ofproto_parser
-
-        self.logger.info(f"Switch has been plugged in PID: {switch_dpid}")
-
-        if switch_dpid not in self.switches:
-            self.datapath_list[switch_dpid] = switch_dp
-            self.switches.append(switch_dpid)
-            self.run_check(ofp_parser, switch_dp)
+        dp = ev.switch.dp
+        dpid = dp.id
+        if dpid not in self.switches:
+            self.switches.append(dpid)
+            self.datapath_list[dpid] = dp
+        self.logger.info("Switch %s connected", dpid)
 
     @set_ev_cls(event.EventSwitchLeave, MAIN_DISPATCHER)
     def switch_leave_handler(self, ev):
-        switch = ev.switch.dp.id
-        if switch in self.switches:
-            try:
-                self.switches.remove(switch)
-                del self.datapath_list[switch]
-                del self.neigh[switch]
-            except KeyError:
-                self.logger.info(f"Switch has been already plugged off PID{switch}!")
+        dpid = ev.switch.dp.id
+        if dpid in self.switches:
+            self.switches.remove(dpid)
+            self.datapath_list.pop(dpid, None)
+            self.neigh.pop(dpid, None)
+            self.logger.info("Switch %s disconnected", dpid)
 
     @set_ev_cls(event.EventLinkAdd, MAIN_DISPATCHER)
     def link_add_handler(self, ev):
-        self.neigh[ev.link.src.dpid][ev.link.dst.dpid] = ev.link.src.port_no
-        self.neigh[ev.link.dst.dpid][ev.link.src.dpid] = ev.link.dst.port_no
+        src = ev.link.src
+        dst = ev.link.dst
+
+        self.neigh[src.dpid][dst.dpid] = src.port_no
+        self.neigh[dst.dpid][src.dpid] = dst.port_no
+
         self.logger.info(
-            f"Link between switches has been established, SW1 DPID: {ev.link.src.dpid}:{ev.link.dst.port_no} SW2 DPID: {ev.link.dst.dpid}:{ev.link.dst.port_no}")
+            "Link up: %s:%s <-> %s:%s",
+            src.dpid, src.port_no, dst.dpid, dst.port_no
+        )
 
-    def find_affected_paths(self, deleted_link):
-        res = []
-        s = deleted_link.src.dpid
-        d = deleted_link.dst.dpid
-        for (src, dst), paths in self.active_paths.items():
-            dpids = list(paths.keys())
-            for i in range(len(dpids) - 1):
-                if (dpids[i] == s and dpids[i + 1] == d) or (dpids[i] ==d and dpids[i + 1] == s):
-                    res.append((src, dst, paths))
+    # ========= Affected paths detection =========
+
+    def find_affected_paths(self, s, d):
+        affected = []
+        for (ip_src, ip_dst), path in self.path_table.items():
+            for i in range(len(path) - 1):
+                if (path[i] == s and path[i+1] == d) or (path[i] == d and path[i+1] == s):
+                    affected.append((ip_src, ip_dst))
                     break
-        return res
+        return affected
 
-    def find_affected_paths_by_port(self, dpid, port):
-        res = []
-        for (src, dst), paths in self.active_paths.items():
-            if dpid not in paths:
+    def find_affected_paths_by_port(self, dpid, port_no):
+        affected = []
+        for (ip_src, ip_dst), path_ports in self.active_paths.items():
+            if dpid not in path_ports:
                 continue
-            in_port, out_port = paths[dpid]
-            if in_port == port or out_port == port:
-                res.append((src, dst, paths))
-        return res
+            in_port, out_port = path_ports[dpid]
+            if in_port == port_no or out_port == port_no:
+                affected.append((ip_src, ip_dst))
+        return affected
 
     @set_ev_cls(event.EventLinkDelete, MAIN_DISPATCHER)
     def link_delete_handler(self, ev):
-        try:
-            src_dpid = ev.link.src.dpid
-            dst_dpid = ev.link.dst.dpid
+        s = ev.link.src.dpid
+        d = ev.link.dst.dpid
 
-            del self.neigh[src_dpid][dst_dpid]
-            del self.neigh[dst_dpid][src_dpid]
+        self.neigh[s].pop(d, None)
+        self.neigh[d].pop(s, None)
 
-            affected_paths = self.find_affected_paths(ev.link)
+        self.logger.info("Link down: %s <-> %s", s, d)
 
-            for src, dst, path in affected_paths:
-                self.logger.info("Removing flows between %s and %s", src, dst)
-                self.remove_flows(path)
-                del self.active_paths[(src, dst)]
+        for ip_src, ip_dst in self.find_affected_paths(s, d):
+            path_ports = self.active_paths.get((ip_src, ip_dst))
+            if path_ports:
+                self.logger.info(
+                    "Removing flows for %s -> %s due to link down",
+                    ip_src, ip_dst
+                )
+                self.remove_flows(path_ports)
+                self.active_paths.pop((ip_src, ip_dst), None)
 
-        except KeyError:
-            self.logger.info("Link has been already plugged off!")
+            src_mac = self.arp_table.get(ip_src)
+            dst_mac = self.arp_table.get(ip_dst)
+            if src_mac in self.hosts and dst_mac in self.hosts:
+                src_sw, src_port = self.hosts[src_mac]
+                dst_sw, dst_port = self.hosts[dst_mac]
+                self.compute_and_install_path(
+                    src_sw, src_port, dst_sw, dst_port, ip_src, ip_dst
+                )
+
+    # ========= Host & Port status (mobility / failure) =========
 
     @set_ev_cls(event.EventHostAdd)
-    def _host_add_handler(self, ev):
+    def host_add_handler(self, ev):
         host = ev.host
         dpid = host.port.dpid
         port = host.port.port_no
-        self.logger.info(f"New host detected: MAC {host.mac}, IPs {host.ipv4} on switch {dpid} - port {port}")
-        self.hosts[host.mac] = (dpid, port)
-        self.arp_table[host.ipv4[0]] = host.mac
+        mac = host.mac
+        ips = host.ipv4
 
-    def remove_paths_by_port(self, datapath, port):
-        affected_paths = self.find_affected_paths_by_port(datapath.id, port.port_no)
+        self.hosts[mac] = (dpid, port)
+        if ips:
+            self.arp_table[ips[0]] = mac
 
-        for src, dst, path in affected_paths:
-            self.logger.info("Removing flows between %s and %s", src, dst)
-            self.remove_flows(path)
-            del self.active_paths[(src, dst)]
+        self.logger.info(
+            "Host added: %s ips=%s at %s:%s",
+            mac, ips, dpid, port
+        )
 
-    def send_repre_arp_request(self, moved_host_ip, datapath):
-        time.sleep(0.5)
+    def get_ip_by_mac(self, mac):
+        for ip, m in self.arp_table.items():
+            if m == mac:
+                return ip
+        return None
+
+    def get_mac_down_port(self, dpid, port_no):
+        for mac, (sw, p) in list(self.hosts.items()):
+            if sw == dpid and p == port_no:
+                return mac
+        return None
+
+    def send_rearp_requests(self, moved_ip, datapath):
+        hub.sleep(0.5)
         parser = datapath.ofproto_parser
-        ofproto = datapath.ofproto
+        ofp = datapath.ofproto
 
-        for src_ip in self.traffic[moved_host_ip]:
-            src_mac = self.arp_table[src_ip]
+        for src_ip in list(self.traffic.get(moved_ip, [])):
+            src_mac = self.arp_table.get(src_ip)
+            if not src_mac:
+                continue
+
             pkt = packet.Packet()
             pkt.add_protocol(ethernet.ethernet(
                 ethertype=ether_types.ETH_TYPE_ARP,
                 src=src_mac,
-                dst='ff:ff:ff:ff:ff:ff'))
+                dst='ff:ff:ff:ff:ff:ff'
+            ))
             pkt.add_protocol(arp.arp(
                 opcode=arp.ARP_REQUEST,
                 src_mac=src_mac,
                 src_ip=src_ip,
                 dst_mac='00:00:00:00:00:00',
-                dst_ip=moved_host_ip))
-
+                dst_ip=moved_ip
+            ))
             pkt.serialize()
-            actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+
+            actions = [parser.OFPActionOutput(ofp.OFPP_FLOOD)]
             out = parser.OFPPacketOut(
                 datapath=datapath,
-                buffer_id=ofproto.OFP_NO_BUFFER,
-                in_port=ofproto.OFPP_CONTROLLER,
+                buffer_id=ofp.OFP_NO_BUFFER,
+                in_port=ofp.OFPP_CONTROLLER,
                 actions=actions,
-                data=pkt.data)
+                data=pkt.data
+            )
             datapath.send_msg(out)
-            self.logger.info(f"ARP REQUEST from {src_ip}:{src_mac} to {moved_host_ip}")
 
-    def get_ip_by_mac(self, mac):
-        for ip, mac_addr in self.arp_table.items():
-            if mac == mac_addr:
-                return ip
+            self.logger.info(
+                "Re-ARP sent from %s(%s) to %s",
+                src_ip, src_mac, moved_ip
+            )
 
-    def get_mac_down_port(self, dpid, port):
-        for key, data in self.hosts.items():
-            if data[0] == dpid and data[1] == port:
-                return key
-
-    def handle_down_port(self, dpid, port):
-        moved_host_mac = self.get_mac_down_port(dpid, port.port_no)
-        if not moved_host_mac:
+    def handle_down_port(self, dpid, port_no):
+        moved_mac = self.get_mac_down_port(dpid, port_no)
+        if not moved_mac:
             return
-        moved_host_ip = self.get_ip_by_mac(moved_host_mac)
-        del self.hosts[moved_host_mac]
-        datapath = self.datapath_list[dpid]
-        threading.Thread(target=self.send_repre_arp_request, args=(moved_host_ip, datapath)).start()
+
+        moved_ip = self.get_ip_by_mac(moved_mac)
+        if not moved_ip:
+            return
+
+        self.hosts.pop(moved_mac, None)
+        dp = self.datapath_list.get(dpid)
+        if dp:
+            hub.spawn(self.send_rearp_requests, moved_ip, dp)
+
+    def remove_paths_by_port(self, dpid, port_no):
+        for ip_src, ip_dst in self.find_affected_paths_by_port(dpid, port_no):
+            path_ports = self.active_paths.get((ip_src, ip_dst))
+            if path_ports:
+                self.logger.info(
+                    "Removing flows for %s -> %s due to port %s on switch %s",
+                    ip_src, ip_dst, port_no, dpid
+                )
+                self.remove_flows(path_ports)
+                self.active_paths.pop((ip_src, ip_dst), None)
 
     @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
     def _port_status_handler(self, ev):
-        port = ev.msg.desc
-        datapath = ev.msg.datapath
-        dpid = datapath.id
-        ofproto = datapath.ofproto
+        msg = ev.msg
+        dp = msg.datapath
+        dpid = dp.id
+        ofp = dp.ofproto
+        port = msg.desc
 
-        if port.port_no == ofproto.OFPP_LOCAL:
+        if port.port_no == ofp.OFPP_LOCAL:
             return
 
-        if ev.msg.reason == ofproto.OFPPR_ADD:
-            self.logger.info(f"Port {port.port_no} is added to switch {datapath.id}")
+        if msg.reason == ofp.OFPPR_ADD:
+            self.logger.info("Port %s added on switch %s", port.port_no, dpid)
 
-        elif ev.msg.reason == ofproto.OFPPR_DELETE:
-            self.logger.info(f"Port {port.port_no} is removed from switch {datapath.id}")
-            self.remove_paths_by_port(datapath, port)
-            self.handle_down_port(dpid, port)
+        elif msg.reason == ofp.OFPPR_DELETE:
+            self.logger.info("Port %s deleted on switch %s", port.port_no, dpid)
+            self.remove_paths_by_port(dpid, port.port_no)
+            self.handle_down_port(dpid, port.port_no)
 
-        elif ev.msg.reason == ofproto.OFPPR_MODIFY:
+        elif msg.reason == ofp.OFPPR_MODIFY:
             if port.state & OFPPS_LINK_DOWN:
-                self.logger.info(f"Port {port.port_no} of switch {datapath.id} is DOWN")
-                self.remove_paths_by_port(datapath, port)
-                self.handle_down_port(dpid, port)
-
+                self.logger.info("Port %s on switch %s is DOWN", port.port_no, dpid)
+                self.remove_paths_by_port(dpid, port.port_no)
+                self.handle_down_port(dpid, port.port_no)
             elif port.state & OFPPS_LIVE:
-                self.logger.info(f"Port {port.port_no} of switch {datapath.id} is UP")
-# End of Controller13
+                self.logger.info("Port %s on switch %s is UP/LIVE", port.port_no, dpid)
+
