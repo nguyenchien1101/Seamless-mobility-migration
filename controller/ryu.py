@@ -374,8 +374,8 @@ class Controller13(app_manager.RyuApp):
             self.arp_table[src_ip] = src_mac
 
             self.logger.info(
-                "IP proto=%s %s(%s) -> %s(%s)",
-                ip_pkt.proto, src_ip, src_mac, dst_ip, dst_mac, dpid
+                "IP proto=%s %s(%s) -> %s(%s) extra=%s",
+                ip.proto, src_ip, src_mac, dst_ip, dst_mac, ip.proto
             )
 
             if dst_mac in self.hosts:
@@ -478,24 +478,6 @@ class Controller13(app_manager.RyuApp):
                 )
 
     # ========= Host & Port status (mobility / failure) =========
-
-    @set_ev_cls(event.EventHostAdd)
-    def host_add_handler(self, ev):
-        host = ev.host
-        dpid = host.port.dpid
-        port = host.port.port_no
-        mac = host.mac
-        ips = host.ipv4
-
-        self.hosts[mac] = (dpid, port)
-        if ips:
-            self.arp_table[ips[0]] = mac
-
-        self.logger.info(
-            "Host added: %s ips=%s at %s:%s",
-            mac, ips, dpid, port
-        )
-
     def get_ip_by_mac(self, mac):
         for ip, m in self.arp_table.items():
             if m == mac:
@@ -599,4 +581,60 @@ class Controller13(app_manager.RyuApp):
                 self.handle_down_port(dpid, port.port_no)
             elif port.state & OFPPS_LIVE:
                 self.logger.info("Port %s on switch %s is UP/LIVE", port.port_no, dpid)
+    @set_ev_cls(event.EventHostAdd)
+    def host_add_handler(self, ev):
+        host = ev.host
+        dpid = host.port.dpid
+        port = host.port.port_no
+        mac = host.mac
+        ips = host.ipv4
 
+        # Vị trí cũ (nếu host đã từng được học)
+        old_loc = self.hosts.get(mac)
+
+        # Cập nhật vị trí mới
+        self.hosts[mac] = (dpid, port)
+
+        moved_ip = None
+        if ips:
+            # Giả sử dùng IP đầu tiên
+            moved_ip = ips[0]
+            self.arp_table[moved_ip] = mac
+
+        self.logger.info(
+            "Host added: %s ips=%s at %s:%s (old=%s)",
+            mac, ips, dpid, port, old_loc
+        )
+
+        # Nếu host đã tồn tại và bây giờ xuất hiện ở switch/port khác -> mobility event
+        if old_loc and old_loc != (dpid, port) and moved_ip:
+            self.logger.info(
+                "Host %s (ip=%s) moved from %s to %s -> clear & recompute paths",
+                mac, moved_ip, old_loc, (dpid, port)
+            )
+
+            # 1. Tìm tất cả các path có liên quan tới IP này
+            affected = []
+            for (ip_src, ip_dst), path_ports in list(self.active_paths.items()):
+                if ip_src == moved_ip or ip_dst == moved_ip:
+                    affected.append((ip_src, ip_dst, path_ports))
+
+            # 2. Xóa flow + cache path cũ
+            for ip_src, ip_dst, path_ports in affected:
+                self.logger.info(
+                    "Removing flows for %s -> %s due to host move",
+                    ip_src, ip_dst
+                )
+                self.remove_flows(path_ports)
+                self.active_paths.pop((ip_src, ip_dst), None)
+                self.path_table.pop((ip_src, ip_dst), None)
+                self.path_with_ports_table.pop((ip_src, ip_dst), None)
+
+            # 3. Gửi lại ARP từ các peer cũ để học lại đường mới (nếu có traffic)
+            dp = self.datapath_list.get(dpid)
+            if dp:
+                hub.spawn(self.send_rearp_requests, moved_ip, dp)
+
+
+
+               
