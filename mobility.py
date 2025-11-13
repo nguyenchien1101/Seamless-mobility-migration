@@ -49,7 +49,7 @@ def topology(args):
     info("*** Configuring environment\n")
     net.setPropagationModel(model="logDistance", exp=4.5)
     net.configureNodes()
-    #net.setAssociationControl('ssf')
+    #net.set ('ssf')
     info("*** Creating links\n")
     net.addLink(ap1, s1)
     net.addLink(ap2, s1)
