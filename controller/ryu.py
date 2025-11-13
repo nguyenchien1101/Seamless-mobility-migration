@@ -33,22 +33,16 @@ class Controller13(app_manager.RyuApp):
         self.hosts = {}
         self.path_table = {}
         self.paths_table = {}
-        self.path_calculation_keeper = []
         self.prev_bytes = defaultdict(dict)
         self.bw = defaultdict(dict)
         self.arp_table = {}
         self.path_with_ports_table = {}
-        self.running = False
-        self.thread1 = None
-        self.thread2 = None
-        self.lock = threading.Lock()
-        self.src = None
-        self.dst = None
-        self.first_port = None
-        self.last_port = None
         self.active_paths = {}
         self.traffic = {}
-
+        self.no_path_logged = set()
+        self.active_paths = {}
+        self.traffic = {}
+        self.no_path_logged = set()
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def _switch_features_handler(self, ev):
         dp = ev.msg.datapath
@@ -106,46 +100,28 @@ class Controller13(app_manager.RyuApp):
         dp.send_msg(mod)
 
     def install_paths(self, src, first_port, dst, last_port, ip_src, ip_dst):
-        # Cập nhật cấu hình cho discovery thread
-        self.configure(src, first_port, dst, last_port)
+        """
+        Tính path đồng bộ rồi cài flow cho ICMP & ARP giữa ip_src và ip_dst.
+        """
         self.active_paths.setdefault((ip_src, ip_dst), {})
 
-        # đợi một chút cho thread discovery cập nhật bảng đường đi
-        time.sleep(0.2)
 
-        key = (src, first_port, dst, last_port)
-
-        # Lấy thông tin path đã tính – nếu chưa có thì fallback
-        path_list = self.path_table.get(key)
-        ports_list = self.path_with_ports_table.get(key)
-
-        if not path_list or not ports_list:
+        ports_map = self.compute_paths(src, first_port, dst, last_port)
+        if not ports_map:
             self.logger.warning(
-                f"No computed path for {key}, fallback to FLOOD for {ip_src}->{ip_dst}"
+                f"No computed path for ({src},{first_port},{dst},{last_port}), "
+                f"fallback to FLOOD for {ip_src}->{ip_dst}"
             )
             return None
 
-        try:
-            temp = ports_list[0]
-            path_obj = path_list[0]
-        except (IndexError, KeyError) as e:
-            self.logger.error(f"install_paths: invalid path data for {key}: {e}")
-            return None
 
-        # Cài flow cho từng switch trên path
-        for node in path_obj.path:
+        for node, (in_port, out_port) in ports_map.items():
             dp = self.datapath_list.get(node)
             if not dp:
                 self.logger.warning(f"Datapath for switch {node} not found, skip")
                 continue
 
             parser = dp.ofproto_parser
-
-            if node not in temp:
-                self.logger.warning(f"No port info for switch {node} in path {key}")
-                continue
-
-            in_port, out_port = temp[node]
             actions = [parser.OFPActionOutput(out_port)]
 
             # Flow cho ICMP
@@ -173,63 +149,59 @@ class Controller13(app_manager.RyuApp):
                 f"ARP flow installed on switch {node}, in_port={in_port}, out_port={out_port}"
             )
 
-        # Lưu path đang active
-        self.active_paths[(ip_src, ip_dst)] = temp
 
-        # Trả về out_port của switch đầu tiên để PacketOut dùng
-        return temp.get(src, (None, None))[1]
+        self.active_paths[(ip_src, ip_dst)] = ports_map
 
-    def configure(self, src, first_port, dst, last_port):
-        with self.lock:
-            self.src = src
-            self.first_port = first_port
-            self.dst = dst
-            self.last_port = last_port
 
-    def start_discovery(self):
-        if not self.running:
-            self.running = True
-            self.thread1 = threading.Thread(target=self._loop, args=(0,))
-            self.thread2 = threading.Thread(target=self._loop, args=(1,))
-            self.thread1.start()
-            self.thread2.start()
+        return ports_map.get(src, (None, None))[1]
 
-    def _loop(self, type_action):
-        while self.running:
-            try:
-                with self.lock:
-                    src = self.src
-                    first_port = self.first_port
-                    dst = self.dst
-                    last_port = self.last_port
 
-                if src and dst:
-                    if type_action == 0:
-                        self.topology_discover(src, first_port, dst, last_port)
-                    elif type_action == 1:
-                        self.topology_discover(dst, last_port, src, first_port)
-                    else: pass
-            except Exception as e:
-                self.logger.error(f"Error in discover: {e}")
-            time.sleep(0.1)
+    def compute_paths(self, src, first_port, dst, last_port):
+        """
+        Tính đường đi & gắn port theo kiểu đồng bộ.
+        Trả về dict {dpid: (in_port, out_port)} cho path tối ưu,
+        hoặc None nếu không có path.
+        """
+        key_pair = (src, dst)
 
-    def topology_discover(self, src, first_port, dst, last_port):
         paths = self.find_paths_and_costs(src, dst)
         if not paths:
-            self.logger.warning(f"No paths found between {src} and {dst}")
-            return
+            if key_pair not in self.no_path_logged:
+                self.logger.info(
+                    f"No paths found between {src} and {dst} "
+                    f"(further messages for this pair will be suppressed)"
+                )
+                self.no_path_logged.add(key_pair)
+            return None
 
-        path = self.find_n_optimal_paths(paths)
-        if not path:
-            self.logger.warning(f"No optimal paths selected between {src} and {dst}")
-            return
 
-        path_with_port = self.add_ports_to_paths(path, first_port, last_port)
+        path_list = self.find_n_optimal_paths(paths)
+        if not path_list:
+            if key_pair not in self.no_path_logged:
+                self.logger.info(
+                    f"No optimal paths selected between {src} and {dst} "
+                    f"(further messages for this pair will be suppressed)"
+                )
+                self.no_path_logged.add(key_pair)
+            return None
+
+
+        if key_pair in self.no_path_logged:
+            self.no_path_logged.remove(key_pair)
+
+
+        path_with_port_list = self.add_ports_to_paths(path_list, first_port, last_port)
+        path_with_port = path_with_port_list[0]
+
         self.logger.info(f"Optimal Path with port: {path_with_port}")
 
-        self.paths_table[(src, first_port, dst, last_port)] = paths
-        self.path_table[(src, first_port, dst, last_port)] = path
-        self.path_with_ports_table[(src, first_port, dst, last_port)] = path_with_port
+
+        key = (src, first_port, dst, last_port)
+        self.paths_table[key] = paths
+        self.path_table[key] = path_list
+        self.path_with_ports_table[key] = path_with_port_list
+
+        return path_with_port
 
 
     def find_paths_and_costs(self, src, dst):
@@ -257,7 +229,6 @@ class Controller13(app_manager.RyuApp):
         if not paths:
             return []
 
-        # Giới hạn số path tối đa = số path có thật
         number_of_optimal_paths = min(number_of_optimal_paths, len(paths))
 
         costs = [path.cost for path in paths]
@@ -301,20 +272,37 @@ class Controller13(app_manager.RyuApp):
         datapath.send_msg(mod)
 
     def find_path_cost(self, path):
-        """ arg path is a list with all nodes in our route """
-        path_cost = []
+        """
+        arg path is a list with all nodes in our route
+
+        Cost = alpha * hop_count + beta * total_link_load
+
+        - hop_count: số link (số switch-đến-switch) trên đường đi
+        - total_link_load: tổng băng thông đang sử dụng trên các link trong path (Mbps)
+        - alpha, beta: hệ số trọng số
+        """
+        hop_count = len(path) - 1
+        if hop_count <= 0:
+            return 0
+
+        total_load = 0.0
         i = 0
         while i < len(path) - 1:
             port1 = self.neigh[path[i]][path[i + 1]]
-            bandwidth_between_two_nodes = self.get_bandwidth(path, port1, i)
-            path_cost.append(bandwidth_between_two_nodes)
+            link_load = self.get_bandwidth(path, port1, i)
+            total_load += link_load
             i += 1
-        return sum(path_cost)
+
+        alpha = 1.0   
+        beta = 0.1    
+
+        return alpha * hop_count + beta * total_load
+
 
     def get_bandwidth(self, path, port, index):
         dpid = path[index]
-        # Nếu chưa có số liệu băng thông → dùng cost mặc định = 1.0
-        return self.bw.get(dpid, {}).get(port, 1.0)
+        
+        return self.bw.get(dpid, {}).get(port, 0.0)
 
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def port_stats_reply_handler(self, ev):
@@ -363,7 +351,7 @@ class Controller13(app_manager.RyuApp):
 
         out_port = ofp.OFPP_FLOOD
 
-        self.start_discovery()
+       # self.start_discovery()
 
         if eth.ethertype == ether_types.ETH_TYPE_ARP and arp_pkt:
             src_ip = arp_pkt.src_ip
