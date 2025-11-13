@@ -25,12 +25,8 @@ class BatchCLI(CLI):
         command = 'ap1 ifconfig ap1-wlan1 up'
         print(self.prompt + command)
         self.onecmd(command)
-
-        #SAU KHI AP1 BẬT LẠI: ép sta1, sta2 kết nối lại ssid-1
-        info("*** Forcing STA reassociation to ssid-1\n")
-        # ép sta1
+        
         self.onecmd('sta1 iwconfig sta1-wlan0 essid "ssid-1"')
-        # ép luôn sta2 cho chắc (có thể giữ nguyên kết nối với ap2)
         self.onecmd('sta2 iwconfig sta2-wlan0 essid "ssid-1"')
 
         return super().run()
