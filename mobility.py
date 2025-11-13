@@ -26,6 +26,7 @@ class BatchCLI(CLI):
         print(self.prompt + command)
         self.onecmd(command)
         
+        time.sleep(3.0)
         self.onecmd('sta1 iwconfig sta1-wlan0 essid "ssid-1"')
         self.onecmd('sta2 iwconfig sta2-wlan0 essid "ssid-1"')
 
@@ -79,7 +80,7 @@ def topology(args):
     ap1.start([c0])
     ap2.start([c0])
     s1.start([c0])
-
+    net.staticArp()
     makeTerm(
         h1,
         title='h1-ping-sta2',
