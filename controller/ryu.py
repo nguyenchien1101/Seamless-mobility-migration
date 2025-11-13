@@ -106,17 +106,49 @@ class Controller13(app_manager.RyuApp):
         dp.send_msg(mod)
 
     def install_paths(self, src, first_port, dst, last_port, ip_src, ip_dst):
+        # Cập nhật cấu hình cho discovery thread
         self.configure(src, first_port, dst, last_port)
         self.active_paths.setdefault((ip_src, ip_dst), {})
+
+        # đợi một chút cho thread discovery cập nhật bảng đường đi
         time.sleep(0.2)
 
-        temp = self.path_with_ports_table[(src, first_port, dst, last_port)][0]
-        for node in self.path_table[(src, first_port, dst, last_port)][0].path:
-            dp = self.datapath_list[node]
+        key = (src, first_port, dst, last_port)
+
+        # Lấy thông tin path đã tính – nếu chưa có thì fallback
+        path_list = self.path_table.get(key)
+        ports_list = self.path_with_ports_table.get(key)
+
+        if not path_list or not ports_list:
+            self.logger.warning(
+                f"No computed path for {key}, fallback to FLOOD for {ip_src}->{ip_dst}"
+            )
+            return None
+
+        try:
+            temp = ports_list[0]
+            path_obj = path_list[0]
+        except (IndexError, KeyError) as e:
+            self.logger.error(f"install_paths: invalid path data for {key}: {e}")
+            return None
+
+        # Cài flow cho từng switch trên path
+        for node in path_obj.path:
+            dp = self.datapath_list.get(node)
+            if not dp:
+                self.logger.warning(f"Datapath for switch {node} not found, skip")
+                continue
+
             parser = dp.ofproto_parser
+
+            if node not in temp:
+                self.logger.warning(f"No port info for switch {node} in path {key}")
+                continue
+
             in_port, out_port = temp[node]
             actions = [parser.OFPActionOutput(out_port)]
 
+            # Flow cho ICMP
             match = parser.OFPMatch(
                 in_port=in_port,
                 eth_type=ether_types.ETH_TYPE_IP,
@@ -125,8 +157,11 @@ class Controller13(app_manager.RyuApp):
                 ip_proto=inet.IPPROTO_ICMP
             )
             self.add_flow(dp, 22222, match, actions, idle_timeout=30)
-            self.logger.info(f"ICMP flow installed on switch {node}, in_port={in_port}, out_port={out_port}")
+            self.logger.info(
+                f"ICMP flow installed on switch {node}, in_port={in_port}, out_port={out_port}"
+            )
 
+            # Flow cho ARP
             match = parser.OFPMatch(
                 in_port=in_port,
                 eth_type=ether_types.ETH_TYPE_ARP,
@@ -134,10 +169,15 @@ class Controller13(app_manager.RyuApp):
                 arp_tpa=ip_dst
             )
             self.add_flow(dp, 11111, match, actions, idle_timeout=30)
-            self.logger.info(f"ARP flow installed on switch {node}, in_port={in_port}, out_port={out_port}")
+            self.logger.info(
+                f"ARP flow installed on switch {node}, in_port={in_port}, out_port={out_port}"
+            )
 
+        # Lưu path đang active
         self.active_paths[(ip_src, ip_dst)] = temp
-        return temp[src][1]
+
+        # Trả về out_port của switch đầu tiên để PacketOut dùng
+        return temp.get(src, (None, None))[1]
 
     def configure(self, src, first_port, dst, last_port):
         with self.lock:
@@ -175,13 +215,22 @@ class Controller13(app_manager.RyuApp):
 
     def topology_discover(self, src, first_port, dst, last_port):
         paths = self.find_paths_and_costs(src, dst)
+        if not paths:
+            self.logger.warning(f"No paths found between {src} and {dst}")
+            return
+
         path = self.find_n_optimal_paths(paths)
+        if not path:
+            self.logger.warning(f"No optimal paths selected between {src} and {dst}")
+            return
+
         path_with_port = self.add_ports_to_paths(path, first_port, last_port)
         self.logger.info(f"Optimal Path with port: {path_with_port}")
 
         self.paths_table[(src, first_port, dst, last_port)] = paths
         self.path_table[(src, first_port, dst, last_port)] = path
         self.path_with_ports_table[(src, first_port, dst, last_port)] = path_with_port
+
 
     def find_paths_and_costs(self, src, dst):
         """
@@ -205,10 +254,19 @@ class Controller13(app_manager.RyuApp):
 
     def find_n_optimal_paths(self, paths, number_of_optimal_paths=MAX_PATHS):
         """arg paths is a list containing lists of possible paths"""
+        if not paths:
+            return []
+
+        # Giới hạn số path tối đa = số path có thật
+        number_of_optimal_paths = min(number_of_optimal_paths, len(paths))
+
         costs = [path.cost for path in paths]
-        optimal_paths_indexes = list(map(costs.index, heapq.nsmallest(number_of_optimal_paths, costs)))
+        optimal_paths_indexes = list(
+            map(costs.index, heapq.nsmallest(number_of_optimal_paths, costs))
+        )
         optimal_paths = [paths[op_index] for op_index in optimal_paths_indexes]
         return optimal_paths
+
 
     def add_ports_to_paths(self, paths, first_port, last_port):
         """
@@ -254,7 +312,9 @@ class Controller13(app_manager.RyuApp):
         return sum(path_cost)
 
     def get_bandwidth(self, path, port, index):
-        return self.bw[path[index]][port]
+        dpid = path[index]
+        # Nếu chưa có số liệu băng thông → dùng cost mặc định = 1.0
+        return self.bw.get(dpid, {}).get(port, 1.0)
 
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def port_stats_reply_handler(self, ev):
@@ -324,6 +384,10 @@ class Controller13(app_manager.RyuApp):
                 out_port = self.install_paths(h1[0], h1[1], h2[0], h2[1], src_ip, dst_ip)
                 self.install_paths(h2[0], h2[1], h1[0], h1[1], dst_ip, src_ip)
 
+                if out_port is None:
+                    out_port = ofp.OFPP_FLOOD
+
+
             elif arp_pkt.opcode == arp.ARP_REQUEST:
                 if dst_ip in self.arp_table:
                     self.arp_table[src_ip] = src_mac
@@ -335,12 +399,16 @@ class Controller13(app_manager.RyuApp):
                         out_port = self.install_paths(h1[0], h1[1], h2[0], h2[1], src_ip, dst_ip)
                         self.install_paths(h2[0], h2[1], h1[0], h1[1], dst_ip, src_ip)
 
+                        if out_port is None:
+                            out_port = ofp.OFPP_FLOOD
+
+
         if eth.ethertype == ether_types.ETH_TYPE_IP and ip_pkt and ip_pkt.proto == inet.IPPROTO_ICMP:
             src_ip = ip_pkt.src
             dst_ip = ip_pkt.dst
             self.arp_table[src_ip] = src_mac
 
-            self.logger.info(f" IP Proto ICMP from: {src_ip} to: {dst_ip}")
+            self.logger.debug(f"IP Proto ICMP from: {src_ip} to: {dst_ip}")
 
         actions = [parser.OFPActionOutput(out_port)]
         out = parser.OFPPacketOut(
@@ -354,8 +422,9 @@ class Controller13(app_manager.RyuApp):
 
     def remove_flows(self, path):
         for dpid, (in_port, out_port) in path.items():
-            datapath = self.datapath_list[dpid]
+            datapath = self.datapath_list.get(dpid)
             if not datapath:
+                self.logger.warning(f"remove_flows: datapath {dpid} not found, skip")
                 continue
             ofproto = datapath.ofproto
             parser = datapath.ofproto_parser
@@ -369,6 +438,7 @@ class Controller13(app_manager.RyuApp):
                 match=match
             )
             datapath.send_msg(mod)
+
 
     @set_ev_cls(event.EventSwitchEnter)
     def switch_enter_handler(self, ev):
@@ -464,8 +534,15 @@ class Controller13(app_manager.RyuApp):
         parser = datapath.ofproto_parser
         ofproto = datapath.ofproto
 
-        for src_ip in self.traffic[moved_host_ip]:
-            src_mac = self.arp_table[src_ip]
+        # Dùng .get để tránh KeyError
+        for src_ip in self.traffic.get(moved_host_ip, set()):
+            src_mac = self.arp_table.get(src_ip)
+            if not src_mac:
+                self.logger.warning(
+                    f"send_repre_arp_request: no MAC found for src_ip {src_ip}"
+                )
+                continue
+
             pkt = packet.Packet()
             pkt.add_protocol(ethernet.ethernet(
                 ethertype=ether_types.ETH_TYPE_ARP,
@@ -489,6 +566,7 @@ class Controller13(app_manager.RyuApp):
             datapath.send_msg(out)
             self.logger.info(f"ARP REQUEST from {src_ip}:{src_mac} to {moved_host_ip}")
 
+
     def get_ip_by_mac(self, mac):
         for ip, mac_addr in self.arp_table.items():
             if mac == mac_addr:
@@ -503,10 +581,28 @@ class Controller13(app_manager.RyuApp):
         moved_host_mac = self.get_mac_down_port(dpid, port.port_no)
         if not moved_host_mac:
             return
+
         moved_host_ip = self.get_ip_by_mac(moved_host_mac)
-        del self.hosts[moved_host_mac]
-        datapath = self.datapath_list[dpid]
-        threading.Thread(target=self.send_repre_arp_request, args=(moved_host_ip, datapath)).start()
+        if not moved_host_ip:
+            self.logger.warning(
+                f"handle_down_port: no IP found for MAC {moved_host_mac}"
+            )
+            return
+
+        datapath = self.datapath_list.get(dpid)
+        if not datapath:
+            self.logger.warning(
+                f"handle_down_port: datapath {dpid} not found, skip ARP rediscovery"
+            )
+            return
+
+        # Xóa host khỏi bảng
+        self.hosts.pop(moved_host_mac, None)
+
+        threading.Thread(
+            target=self.send_repre_arp_request,
+            args=(moved_host_ip, datapath)
+        ).start()
 
     @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
     def _port_status_handler(self, ev):
