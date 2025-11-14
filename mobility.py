@@ -28,7 +28,7 @@ def trigger_link_failure(cli, ap='ap2', iface='ap2-wlan1', down_time=4):
     cli.onecmd(cmd_up)
 
     info(f"*** {iface} is UP again, forcing STA re-association...\n")
-    # Ép các STA roaming join lại SSID ssid-1
+
     cli.onecmd('sta1 iwconfig sta1-wlan0 essid "ssid-1"')
     cli.onecmd('sta2 iwconfig sta2-wlan0 essid "ssid-1"')
 
@@ -53,17 +53,11 @@ def topology(args):
     info("*** Creating nodes\n")
     h1 = net.addHost('h1', ip='10.0.0.1/8')
 
-    # STA:
-    # - sta1 & sta2: roaming giữa ap1 và ap2
-    # - sta3: đứng cố định gần ap3 (client tĩnh)
-    sta2 = net.addStation('sta2', ip='10.0.0.2/8', position='60,70,0')    # gần ap1 lúc đầu
-    sta1 = net.addStation('sta1', ip='10.0.0.3/8', position='140,50,0')   # gần ap2 lúc đầu
-    sta3 = net.addStation('sta3', ip='10.0.0.4/8', position='100,120,0')  # client tĩnh của ap3
 
-    # APs sắp thành tam giác cho đẹp:
-    #  - ap1: góc trái dưới
-    #  - ap2: góc phải dưới
-    #  - ap3: trên giữa
+    sta2 = net.addStation('sta2', ip='10.0.0.2/8', position='60,70,0')    
+    sta1 = net.addStation('sta1', ip='10.0.0.3/8', position='140,50,0')   
+    sta3 = net.addStation('sta3', ip='10.0.0.4/8', position='100,120,0')  
+
     ap1 = net.addAccessPoint(
         'ap1', ssid='ssid-1', mode='g',
         channel='1', position='40,40,0', range=45
