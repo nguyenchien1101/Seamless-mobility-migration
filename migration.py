@@ -3,6 +3,7 @@ from mininet.node import Controller, RemoteController, OVSKernelSwitch, Host
 from mininet.cli import CLI
 from mininet.log import setLogLevel, info
 from mininet.link import TCLink
+from mininet.term import makeTerm
 
 class CustomCLI(CLI):
 
@@ -142,14 +143,27 @@ def myNetwork():
     for controller in net.controllers:
         controller.start()
 
-    info( '*** Starting switches\n')
+    info('*** Starting switches\n')
     net.get('s1').start([c0])
     net.get('s2').start([c0])
     net.get('s3').start([c0])
     net.get('s4').start([c0])
 
-    info('*** Ready — starting Custom CLI\n')
+    h2 = net.get('h2')
+    h3 = net.get('h3')
+
+    info('*** Starting continuous pings from h3\n')
+
+
+    makeTerm(
+    h3,
+    title='h3-ping-h2',
+    cmd='bash -c "ping -i 0.1 -D 10.0.0.2; exec bash"'
+    )
+
+    info('*** Running CLI\n')
     CustomCLI(net)
+
 
     net.stop()
 
